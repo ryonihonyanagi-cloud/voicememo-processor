@@ -1,0 +1,40 @@
+# Environments
+.env
+.venv
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs and Data
+logs/
+staging/
+processed_files.json
+status.json
+launchd-out.log
+launchd-err.log
+monitor-out.log
+monitor-err.log
+
+# Generated files
+*.zip
+com.voicememo.processor.plist
+com.voicememo.monitor.plist
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Mac OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo

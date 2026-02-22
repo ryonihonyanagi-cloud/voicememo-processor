@@ -1,0 +1,4 @@
+openai>=1.12.0
+python-dotenv>=1.0.0
+mlx-whisper>=0.4.0
+rumps>=0.4.0
