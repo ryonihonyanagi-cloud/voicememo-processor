@@ -28,7 +28,16 @@ During setup, you will be asked for the absolute path of your USB Voice Recorder
 
 ### Installation & Setup
 
-#### macOS Setup (Fully Automated)
+#### 🚀 macOS Setup (One-Line Install)
+Open your Terminal and paste the following single command to download and start the setup automatically:
+```bash
+git clone https://github.com/ryonihonyanagi-cloud/voicememo-processor.git ~/voicememo-processor && cd ~/voicememo-processor && ./install.sh
+```
+The setup wizard will prompt you for your API key and absolute paths interactively.
+**Done!** The system will now automatically run in the background whenever you plug in the USB device.
+
+*(Manual Setup Method)*
+If you prefer step-by-step:
 1. Open Terminal.
 2. Clone or download this repository, then navigate to the folder:
    ```bash
@@ -38,8 +47,6 @@ During setup, you will be asked for the absolute path of your USB Voice Recorder
    ```bash
    ./install.sh
    ```
-4. The setup wizard will prompt you for your absolute paths.
-5. **Done!** The system will now automatically run in the background whenever you plug in the USB device.
 
 #### Windows Setup (Manual Execution)
 *Note: Due to system differences, Windows does not support `LaunchAgent` (USB auto-detection) or `mlx-whisper` (Apple Silicon optimized AI).*
@@ -89,7 +96,16 @@ During setup, you will be asked for the absolute path of your USB Voice Recorder
 
 ### インストールと初期設定
 
-#### macOSでのセットアップ（完全自動化）
+#### 🚀 macOSでのセットアップ（一発インストール）
+「ターミナル」を開き、以下のコマンドを1行まるごとコピーして貼り付け、Enterキーを押すだけで自動的にダウンロードと設定が開始されます：
+```bash
+git clone https://github.com/ryonihonyanagi-cloud/voicememo-processor.git ~/voicememo-processor && cd ~/voicememo-processor && ./install.sh
+```
+画面の指示に従って、APIキーや各フォルダの絶対パスを入力してください。
+**完了です！** 今後はUSBをMacに挿すだけで、全自動でバックグラウンド処理が開始されます。画面右上のメニューバーの 🎙️ アイコンで進捗が確認できます。
+
+*(手動でセットアップする場合)*
+順番に実行したい場合は以下を実行してください：
 1. 「ターミナル」を開き、ダウンロードしたフォルダに移動します。
    ```bash
    cd /path/to/voicememo-processor
@@ -98,8 +114,6 @@ During setup, you will be asked for the absolute path of your USB Voice Recorder
    ```bash
    ./install.sh
    ```
-3. 画面の指示に従って、APIキーや各フォルダの絶対パスを入力してください。
-4. **完了です！** 今後はUSBをMacに挿すだけで、全自動でバックグラウンド処理が開始されます。画面右上のメニューバーの 🎙️ アイコンで進捗が確認できます。
 
 #### Windowsでのセットアップ（手動実行）
 *※注意: WindowsではUSBの自動検知（LaunchAgent）や、Mac専用AI（mlx-whisper）がそのままでは動作しません。*
