@@ -789,7 +789,7 @@ def summarize_transcripts(
       "duration_min": 150,
       "category": "カテゴリ（例: 仕事・打合せ・移動・食事・プライベート・学習など）",
       "activity": "活動内容（簡潔に）",
-      "details": "具体的な内容・話題・成果など（2〜3文）"
+      "details": "具体的な内容・話題・成果など（3〜5文。何を話したか、どんな意思決定があったか、どんな結果や気づきが生まれたかまで詳しく書く）"
     }}
   ],
   "deep_conversations": [
@@ -869,7 +869,7 @@ def summarize_transcripts(
       "duration_min": 60,
       "category": "カテゴリ",
       "activity": "活動内容",
-      "details": "具体的な内容（2〜3文）"
+      "details": "具体的な内容（3〜5文。何を話したか、どんな意思決定があったか、どんな結果や気づきが生まれたかまで詳しく書く）"
     }}
   ],
   "deep_conversations": [
@@ -1009,17 +1009,21 @@ def generate_markdown(
     if time_breakdown:
         lines.append("## ⏱ 時間の使い方")
         lines.append("")
-        lines.append("| 時間帯 | 時間 | カテゴリ | 活動 | 詳細 |")
-        lines.append("|---|---|---|---|---|")
         for act in time_breakdown:
             time_str = act.get("time", "—")
             dur = act.get("duration_min", 0)
             dur_str = _format_duration(dur) if dur else "—"
-            category = act.get("category", "—")
+            category = act.get("category", "")
             activity = act.get("activity", "")
             details = act.get("details", "")
-            lines.append(f"| {time_str} | {dur_str} | {category} | {activity} | {details} |")
-        lines.append("")
+            # Card-style: subheading with time + category badge, then details paragraph
+            badge = f" `{category}`" if category else ""
+            lines.append(f"### 🕐 {time_str}  ({dur_str}){badge}")
+            lines.append(f"**{activity}**")
+            lines.append("")
+            if details:
+                lines.append(details)
+            lines.append("")
 
     # ── Deep conversations / Highlights ──────────
     deep_convs = summary_data.get("deep_conversations", [])
