@@ -56,7 +56,7 @@ STAGING_DIR = SCRIPT_DIR / "staging"  # Local MP3 copies to avoid FUSE deadlock
 
 MP3_BITRATE = "64k"
 WHISPER_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
-GEMINI_MODEL = "gemini-3.1-pro-preview"
+GEMINI_MODEL = "gemini-3-pro-preview"
 
 # File naming: 2026-02-11-17-53-58.WAV
 FILENAME_PATTERN = re.compile(
