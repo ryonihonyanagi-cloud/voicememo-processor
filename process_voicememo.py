@@ -776,29 +776,47 @@ def summarize_transcripts(
     # If short enough, summarize in one shot
     if len(transcript_block) <= MAX_CHARS_PER_CHUNK:
         prompt = f"""以下は{date}のボイスメモの文字起こしです。
-これを日報として整理してください。各録音の時刻から、何時頃に何をしていたかを推定してください。
+これを分析して、詳細な日報として整理してください。
 
 {transcript_block}
 
 以下の形式でJSON出力してください:
 {{
-  "summary": "この日1日の活動の流れ（3-5文、日本語）",
-  "activities": [
+  "summary": "この日1日の活動の流れ（5〜8文、時系列で。何をして、どう動いて、どんなことを考えていたかを具体的に）",
+  "time_breakdown": [
     {{
-      "time": "14:55〜16:56",
-      "duration_min": 120,
-      "activity": "活動内容（短く）",
-      "details": "具体的な内容や話題（1-2文）"
+      "time": "09:00〜11:30",
+      "duration_min": 150,
+      "category": "カテゴリ（例: 仕事・打合せ・移動・食事・プライベート・学習など）",
+      "activity": "活動内容（簡潔に）",
+      "details": "具体的な内容・話題・成果など（2〜3文）"
     }}
   ],
-  "action_items": ["フォローアップすべきこと", "TODO"]
+  "deep_conversations": [
+    {{
+      "topic": "話題のタイトル",
+      "insight": "この会話・考えのエッセンス（2〜4文）。抽象度が高い、考えが深い、ユニークな視点など価値あるもの。",
+      "quote": "会話から印象的・本質的なひとことを原文に近い形で抜粋（あれば）"
+    }}
+  ],
+  "action_items": ["今後やるべきこと", "決定事項", "フォローアップ"],
+  "x_threads_posts": [
+    {{
+      "platform": "X",
+      "content": "ポスト文（140文字以内、日本語。この日の気づきや考えを発信できる形に。ハッシュタグもあれば）"
+    }},
+    {{
+      "platform": "Threads",
+      "content": "Threads投稿文（500文字以内。やや長めで、思考の流れや背景も含めて。X版より深く書く）"
+    }}
+  ]
 }}
 
 ルール:
-- summaryはこの日1日の流れを客観的にまとめてください
-- activitiesは録音時刻をもとに、時間帯ごとの活動を抽出してください。移動中・雑談・環境音のみの録音は含めなくてOKです
-- duration_minは推定所要時間（分）です
-- action_itemsは今後やるべきこと、決定事項、フォローアップを抽出してください。なければ空配列で構いません
+- summaryはこの日1日の流れを時系列で具体的にまとめてください
+- time_breakdownは録音時刻をもとに時間帯ごとの活動を列挙。移動中・雑談・環境音のみの時間帯は含めなくてOKです
+- deep_conversationsは「抽象度が高い」「本質的」「ユニークな視点がある」「学びや気づきがある」会話・思考を2〜5件抜粋。なければ1件以上は無理に入れなくてOK
+- x_threads_postsはこの日のボイスメモの内容から、SNSで発信する価値がある気づき・意見・出来事をポスト案として提案してください。2〜3案あると良い
 - 全て日本語で出力してください"""
         return _call_summary_api(client, prompt)
 
@@ -838,28 +856,36 @@ def summarize_transcripts(
         logger.info(f"  Summarizing chunk {ci}/{len(chunks)} ({time_range})")
 
         chunk_prompt = f"""以下は{date}のボイスメモの一部（{time_range}）の文字起こしです。
-この時間帯に何をしていたかを抽出してください。
+この時間帯に何をしていたか、どんな会話や考えがあったかを詳しく抽出してください。
 
 {chunk_block}
 
 以下の形式でJSON出力してください:
 {{
-  "summary": "この時間帯の活動の要約（2-3文、日本語）",
-  "activities": [
+  "summary": "この時間帯の活動・思考の要約（3〜5文）",
+  "time_breakdown": [
     {{
-      "time": "開始時刻〜終了時刻",
+      "time": "開始〜終了",
       "duration_min": 60,
-      "activity": "活動内容（短く）",
-      "details": "具体的な内容（1-2文）"
+      "category": "カテゴリ",
+      "activity": "活動内容",
+      "details": "具体的な内容（2〜3文）"
     }}
   ],
-  "action_items": ["TODOやフォローアップ"]
+  "deep_conversations": [
+    {{
+      "topic": "話題",
+      "insight": "エッセンス（2〜3文）",
+      "quote": "印象的な一言（あれば）"
+    }}
+  ],
+  "action_items": ["TODO"]
 }}
 
 ルール:
-- activitiesは録音時刻をもとに、時間帯ごとの活動を抽出してください
-- 移動中・環境音のみの録音は含めなくてOKです
-- action_itemsがなければ空配列で構いません
+- time_breakdownは録音時刻をもとに活動を列挙
+- deep_conversationsは抽象度が高い・本質的・ユニークな会話や思考を抽出
+- action_itemsがなければ空配列
 - 全て日本語で出力してください"""
 
         partial = retry_with_backoff(
@@ -874,41 +900,74 @@ def summarize_transcripts(
     for ci, ps in enumerate(partial_summaries, 1):
         merge_input += f"\n--- パート{ci} ---\n"
         merge_input += f"要約: {ps.get('summary', '')}\n"
-        if ps.get("activities"):
+        if ps.get("time_breakdown"):
             merge_input += "活動:\n"
+            for act in ps["time_breakdown"]:
+                merge_input += (
+                    f"- {act.get('time', '?')} [{act.get('category', '')}]: {act.get('activity', '')} "
+                    f"({act.get('duration_min', '?')}分) — {act.get('details', '')}\n"
+                )
+        # Legacy support
+        if ps.get("activities"):
+            merge_input += "活動(旧形式):\n"
             for act in ps["activities"]:
                 merge_input += (
                     f"- {act.get('time', '?')}: {act.get('activity', '')} "
                     f"({act.get('duration_min', '?')}分) — {act.get('details', '')}\n"
                 )
+        if ps.get("deep_conversations"):
+            merge_input += "深い会話・考察:\n"
+            for dc in ps["deep_conversations"]:
+                merge_input += f"- [{dc.get('topic','')}] {dc.get('insight','')}\n"
+                if dc.get("quote"):
+                    merge_input += f"  引用: 「{dc.get('quote','')}」\n"
         if ps.get("action_items"):
             merge_input += "アクションアイテム:\n"
             for ai in ps["action_items"]:
                 merge_input += f"- {ai}\n"
 
-    merge_prompt = f"""以下は{date}のボイスメモを複数パートに分けて日報化した結果です。
-これらを統合して、1日全体の日報を作成してください。
+    merge_prompt = f"""以下は{date}のボイスメモを複数パートに分けて分析した結果です。
+これらを統合して、1日全体の詳細な日報を作成してください。
 
 {merge_input}
 
 以下の形式でJSON出力してください:
 {{
-  "summary": "この日1日の活動の流れ（3-5文、日本語）",
-  "activities": [
+  "summary": "この日1日の活動の流れ（5〜8文）",
+  "time_breakdown": [
     {{
       "time": "開始〜終了",
       "duration_min": 60,
+      "category": "カテゴリ",
       "activity": "活動内容",
-      "details": "詳細"
+      "details": "詳細（2〜3文）"
     }}
   ],
-  "action_items": ["TODO1", "TODO2"]
+  "deep_conversations": [
+    {{
+      "topic": "話題",
+      "insight": "エッセンス（2〜4文）",
+      "quote": "印象的な一言（あれば）"
+    }}
+  ],
+  "action_items": ["TODO1", "TODO2"],
+  "x_threads_posts": [
+    {{
+      "platform": "X",
+      "content": "ポスト文（140文字以内）"
+    }},
+    {{
+      "platform": "Threads",
+      "content": "Threads投稿文（500文字以内、やや詳しく）"
+    }}
+  ]
 }}
 
 ルール:
-- summaryは1日の流れを時系列でまとめてください
-- activitiesは全パートの活動を統合し、重複を排除して時系列で並べてください
-- action_itemsは全パートから重要なものを選んでください
+- summaryは1日の流れを時系列で具体的にまとめてください
+- time_breakdownは全パートの活動を統合して時系列で並べ、重複を排除してください
+- deep_conversationsは全パートから本質的・ユニーク・学びのある会話を2〜5件選んでください
+- x_threads_postsはこの日の内容から発信価値のある気づきや意見を提案してください
 - 全て日本語で出力してください"""
 
     return _call_summary_api(client, merge_prompt)
@@ -936,50 +995,83 @@ def generate_markdown(
     date: str, recordings: list[dict], summary_data: dict
 ) -> str:
     lines = []
-    lines.append(f"# 日報 - {date}")
+    lines.append(f"# 📓 日報 — {date}")
     lines.append("")
-    lines.append("## まとめ")
+
+    # ── Summary ─────────────────────────────────
+    lines.append("## 🗓 サマリー")
     lines.append("")
     lines.append(summary_data.get("summary", "(要約なし)"))
     lines.append("")
 
-    # Activity log (new format)
-    activities = summary_data.get("activities", [])
-    if activities:
-        lines.append("## 活動ログ")
+    # ── Time breakdown ───────────────────────────
+    time_breakdown = summary_data.get("time_breakdown", []) or summary_data.get("activities", [])
+    if time_breakdown:
+        lines.append("## ⏱ 時間の使い方")
         lines.append("")
-        lines.append("| 時間帯 | 所要時間 | 活動内容 | 詳細 |")
-        lines.append("|---|---|---|---|")
-        for act in activities:
+        lines.append("| 時間帯 | 時間 | カテゴリ | 活動 | 詳細 |")
+        lines.append("|---|---|---|---|---|")
+        for act in time_breakdown:
             time_str = act.get("time", "—")
             dur = act.get("duration_min", 0)
             dur_str = _format_duration(dur) if dur else "—"
+            category = act.get("category", "—")
             activity = act.get("activity", "")
             details = act.get("details", "")
-            lines.append(f"| {time_str} | {dur_str} | {activity} | {details} |")
+            lines.append(f"| {time_str} | {dur_str} | {category} | {activity} | {details} |")
         lines.append("")
 
-    # Backward compatibility: show highlights if present (old format)
+    # ── Deep conversations / Highlights ──────────
+    deep_convs = summary_data.get("deep_conversations", [])
+    if deep_convs:
+        lines.append("## 💡 深い会話・気づき")
+        lines.append("")
+        for dc in deep_convs:
+            topic = dc.get("topic", "")
+            insight = dc.get("insight", "")
+            quote = dc.get("quote", "")
+            lines.append(f"### {topic}")
+            lines.append(insight)
+            if quote:
+                lines.append("")
+                lines.append(f"> 「{quote}」")
+            lines.append("")
+
+    # ── Backward compat: old highlights field ────
     highlights = summary_data.get("highlights", [])
-    if highlights and not activities:
-        lines.append("## ハイライト")
+    if highlights and not deep_convs:
+        lines.append("## 💡 ハイライト")
         lines.append("")
         for h in highlights:
             lines.append(f"- {h}")
         lines.append("")
 
-    # Action items
+    # ── Action items ─────────────────────────────
     action_items = summary_data.get("action_items", [])
     if action_items:
-        lines.append("## アクションアイテム")
+        lines.append("## ✅ アクションアイテム")
         lines.append("")
         for item in action_items:
             lines.append(f"- [ ] {item}")
         lines.append("")
 
+    # ── SNS Post Suggestions ─────────────────────
+    posts = summary_data.get("x_threads_posts", [])
+    if posts:
+        lines.append("## 📣 情報発信・投稿案")
+        lines.append("")
+        for post in posts:
+            platform = post.get("platform", "SNS")
+            content = post.get("content", "")
+            lines.append(f"### {platform}")
+            lines.append("")
+            lines.append(content)
+            lines.append("")
+
+    # ── Transcript ───────────────────────────────
     lines.append("---")
     lines.append("")
-    lines.append("## 文字起こし")
+    lines.append("## 📝 文字起こし")
     lines.append("")
 
     for rec in recordings:
@@ -987,7 +1079,6 @@ def generate_markdown(
         lines.append(f"### {rec['time']} Recording ({duration_str})")
         lines.append("")
 
-        # Re-apply hallucination filter at output time (catches updated rules)
         clean_segments = filter_hallucinated_segments(rec["segments"])
         for seg in clean_segments:
             ts = format_timestamp(seg["start"])
