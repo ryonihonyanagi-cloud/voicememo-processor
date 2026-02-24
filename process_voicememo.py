@@ -49,6 +49,7 @@ MP3_BASE_DIR = Path(os.environ.get(
 SCRIPT_DIR = Path(__file__).parent.resolve()
 MANIFEST_PATH = SCRIPT_DIR / "processed_files.json"
 STATUS_PATH = SCRIPT_DIR / "status.json"
+USER_PROFILE_PATH = SCRIPT_DIR / "user_profile.json"  # Accumulating persona context
 LOG_DIR = SCRIPT_DIR / "logs"
 STAGING_DIR = SCRIPT_DIR / "staging"  # Local MP3 copies to avoid FUSE deadlock
 
@@ -62,6 +63,115 @@ FILENAME_PATTERN = re.compile(
 )
 
 logger = logging.getLogger("voicememo")
+
+
+# ──────────────────────────────────────────────
+# User Profile (Context Accumulation for SNS Posts)
+# ──────────────────────────────────────────────
+
+def load_user_profile() -> dict:
+    """Load or initialize the user profile for context-aware SNS post generation."""
+    if USER_PROFILE_PATH.exists():
+        try:
+            return json.loads(USER_PROFILE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "frequent_topics": [],          # Topics that come up often (accumulated)
+        "tone_description": "",          # Writing tone/style inferred from posts
+        "example_posts": [],             # Last N successful/generated posts (for style reference)
+        "interests": [],                 # Inferred interest areas
+        "last_updated": ""
+    }
+
+
+def save_user_profile(profile: dict):
+    """Persist the updated user profile."""
+    import datetime
+    profile["last_updated"] = datetime.datetime.now().isoformat()
+    USER_PROFILE_PATH.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_user_profile(client, date: str, summary_data: dict, profile: dict) -> dict:
+    """Ask GPT-4o to merge today's insights into the running user profile."""
+    new_posts = summary_data.get("x_threads_posts", [])
+    new_topics = summary_data.get("deep_conversations", [])
+    today_summary = summary_data.get("summary", "")
+
+    # Keep a rolling window of the 20 most recent posts as style examples
+    all_posts = profile.get("example_posts", []) + [
+        p.get("content", "") for p in new_posts if p.get("content")
+    ]
+    profile["example_posts"] = all_posts[-20:]
+
+    # Ask GPT to update the topic list and tone description
+    topics_block = "\n".join(
+        f"- {dc.get('topic', '')}: {dc.get('insight', '')}" for dc in new_topics
+    )
+    examples_block = "\n".join(f"- {p}" for p in all_posts[-5:])
+
+    update_prompt = f"""あなたはSNS投稿のパーソナライズを担当するAIです。
+以下の情報をもとに、このユーザーの発信スタイルやよく語るテーマのプロフィールを更新してください。
+
+【今日の日付】{date}
+【今日のサマリー】{today_summary}
+
+【今日の深い会話・気づき】
+{topics_block}
+
+【過去の投稿例（最近のもの）】
+{examples_block}
+
+【現在のプロフィール】
+よく語るテーマ: {', '.join(profile.get('frequent_topics', []))}
+文体・トーン: {profile.get('tone_description', '(未設定)')}
+興味・関心: {', '.join(profile.get('interests', []))}
+
+以下のJSON形式で更新されたプロフィールを出力してください:
+{{
+  "frequent_topics": ["テーマ1", "テーマ2", ...],  // 今日の内容も踏まえ、重要度が高い順に最大15件
+  "tone_description": "このユーザーの文体・発信スタイルの説明（3〜5文）",
+  "interests": ["関心領域1", "関心領域2", ...]   // 主な関心領域、最大10件
+}}
+
+ルール:
+- frequent_topicsは今日新たに登場したテーマも追加してください
+- 既存のテーマと重複するものはまとめてください
+- tone_descriptionは過去の投稿例から文体・トーン・言葉選びの傾向を描写してください
+- 全て日本語"""
+
+    try:
+        result = _call_summary_api(client, update_prompt)
+        if isinstance(result, dict):
+            if result.get("frequent_topics"):
+                profile["frequent_topics"] = result["frequent_topics"]
+            if result.get("tone_description"):
+                profile["tone_description"] = result["tone_description"]
+            if result.get("interests"):
+                profile["interests"] = result["interests"]
+    except Exception as e:
+        logger.warning(f"  Profile update failed (non-critical): {e}")
+
+    return profile
+
+
+def _build_profile_context(profile: dict) -> str:
+    """Format the user profile as a context block for injection into prompts."""
+    if not profile.get("frequent_topics") and not profile.get("tone_description"):
+        return ""  # No profile yet — first run
+    parts = []
+    if profile.get("frequent_topics"):
+        parts.append(f"よく語るテーマ: {', '.join(profile['frequent_topics'][:10])}")
+    if profile.get("interests"):
+        parts.append(f"関心領域: {', '.join(profile['interests'][:6])}")
+    if profile.get("tone_description"):
+        parts.append(f"文体・トーン: {profile['tone_description']}")
+    if profile.get("example_posts"):
+        examples = profile["example_posts"][-3:]
+        parts.append("過去の投稿例:")
+        for ex in examples:
+            parts.append(f"  - {ex[:120]}{'...' if len(ex) > 120 else ''}")
+    return "\n".join(parts)
 
 
 # ──────────────────────────────────────────────
@@ -763,7 +873,8 @@ MAX_CHARS_PER_CHUNK = 20000  # ~7,000 tokens — safe for 30k TPM limit
 
 
 def summarize_transcripts(
-    client: openai.OpenAI, date: str, recordings: list[dict]
+    client: openai.OpenAI, date: str, recordings: list[dict],
+    profile: dict | None = None
 ) -> dict:
     """Call GPT-4o to generate summary and highlights.
 
@@ -771,6 +882,26 @@ def summarize_transcripts(
     chunks, each chunk is summarized individually, and the partial summaries
     are merged in a final API call.
     """
+    profile = profile or {}
+    profile_ctx = _build_profile_context(profile)
+    profile_section = f"""
+【投稿者プロフィール（コンテキスト）】
+{profile_ctx}
+""" if profile_ctx else ""
+
+    # SNS post instructions (shared between single / merge prompts)
+    _sns_instructions = f"""{profile_section}
+以下の観点で、SNSに投稿できるポスト案を5〜10件生成してください。それぞれ異なる角度・フォーマットで:
+- 【気づき型】: 今日学んだこと・気づいたことをシンプルに
+- 【問いかけ型】: 読者に考えさせる問いを立てる
+- 【意見型】: 自分の意見・立場を明確にしたポスト
+- 【ストーリー型】: 今日の出来事を短いエピソードとして
+- 【引用型】: 会話の中の印象的な言葉を軸に
+- 【洞察型】: 抽象度を上げた深い考察
+- 【Threads用ロング】: 500文字程度で思考プロセスごと書くポスト
+プラットフォームはX（140文字以内）かThreads（500文字以内）で指定してください。
+このユーザーのプロフィールが蓄積されるほど、トーンや興味に合ったポストになるように書いてください。"""
+
     transcript_block = _build_transcript_block(recordings)
 
     # If short enough, summarize in one shot
@@ -802,12 +933,9 @@ def summarize_transcripts(
   "action_items": ["今後やるべきこと", "決定事項", "フォローアップ"],
   "x_threads_posts": [
     {{
-      "platform": "X",
-      "content": "ポスト文（140文字以内、日本語。この日の気づきや考えを発信できる形に。ハッシュタグもあれば）"
-    }},
-    {{
-      "platform": "Threads",
-      "content": "Threads投稿文（500文字以内。やや長めで、思考の流れや背景も含めて。X版より深く書く）"
+      "platform": "X または Threads",
+      "type": "気づき型・問いかけ型・意見型・ストーリー型・引用型・洞察型・Threads用ロング のいずれか",
+      "content": "ポスト文（X=140文字以内 / Threads=500文字以内）"
     }}
   ]
 }}
@@ -815,9 +943,11 @@ def summarize_transcripts(
 ルール:
 - summaryはこの日1日の流れを時系列で具体的にまとめてください
 - time_breakdownは録音時刻をもとに時間帯ごとの活動を列挙。移動中・雑談・環境音のみの時間帯は含めなくてOKです
-- deep_conversationsは「抽象度が高い」「本質的」「ユニークな視点がある」「学びや気づきがある」会話・思考を2〜5件抜粋。なければ1件以上は無理に入れなくてOK
-- x_threads_postsはこの日のボイスメモの内容から、SNSで発信する価値がある気づき・意見・出来事をポスト案として提案してください。2〜3案あると良い
-- 全て日本語で出力してください"""
+- deep_conversationsは「抽象度が高い」「本質的」「ユニークな視点がある」「学びや気づきがある」会話・思考を2〜5件抜粋
+- x_threads_postsは上記の指示に従って5〜10件生成。角度・タイプが被らないようにする
+- 全て日本語で出力してください
+
+{_sns_instructions}"""
         return _call_summary_api(client, prompt)
 
     # --- Chunked summarization for long transcripts ---
@@ -953,12 +1083,9 @@ def summarize_transcripts(
   "action_items": ["TODO1", "TODO2"],
   "x_threads_posts": [
     {{
-      "platform": "X",
-      "content": "ポスト文（140文字以内）"
-    }},
-    {{
-      "platform": "Threads",
-      "content": "Threads投稿文（500文字以内、やや詳しく）"
+      "platform": "X または Threads",
+      "type": "気づき型・問いかけ型・意見型・ストーリー型・引用型・洞察型・Threads用ロング のいずれか",
+      "content": "ポスト文（X=140文字以内 / Threads=500文字以内）"
     }}
   ]
 }}
@@ -967,8 +1094,10 @@ def summarize_transcripts(
 - summaryは1日の流れを時系列で具体的にまとめてください
 - time_breakdownは全パートの活動を統合して時系列で並べ、重複を排除してください
 - deep_conversationsは全パートから本質的・ユニーク・学びのある会話を2〜5件選んでください
-- x_threads_postsはこの日の内容から発信価値のある気づきや意見を提案してください
-- 全て日本語で出力してください"""
+- x_threads_postsは上記の指示に従って5〜10件生成してください
+- 全て日本語で出力してください
+
+{_sns_instructions}"""
 
     return _call_summary_api(client, merge_prompt)
 
@@ -1064,10 +1193,12 @@ def generate_markdown(
     if posts:
         lines.append("## 📣 情報発信・投稿案")
         lines.append("")
-        for post in posts:
+        for i, post in enumerate(posts, 1):
             platform = post.get("platform", "SNS")
+            post_type = post.get("type", "")
             content = post.get("content", "")
-            lines.append(f"### {platform}")
+            badge = f" `{post_type}`" if post_type else ""
+            lines.append(f"### {i}. {platform}{badge}")
             lines.append("")
             lines.append(content)
             lines.append("")
@@ -1119,6 +1250,7 @@ def phase3_generate_markdown(
 ):
     """Phase 3: Generate Markdown reports with GPT-4o summaries."""
     MARKDOWN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    profile = load_user_profile()  # Load once; accumulates across dates
 
     for date in sorted(dates_to_regenerate):
         logger.info(f"Generating Markdown for {date}")
@@ -1146,10 +1278,10 @@ def phase3_generate_markdown(
         notify("Voice Memo", f"Phase 3: {date} の要約とMarkdown生成中...")
         update_status("processing", 3, "要約・Markdown生成中", date, len(dates_to_regenerate), list(sorted(dates_to_regenerate)).index(date))
 
-        # Summarize with GPT-4o
+        # Summarize with GPT-4o (pass accumulated profile for SNS post quality)
         try:
             summary_data = retry_with_backoff(
-                lambda: summarize_transcripts(client, date, recordings)
+                lambda d=date, r=recordings: summarize_transcripts(client, d, r, profile=profile)
             )
         except Exception as e:
             logger.warning(
@@ -1166,6 +1298,17 @@ def phase3_generate_markdown(
             md_path = MARKDOWN_OUTPUT_DIR / f"voicememo-{date}.md"
             md_path.write_text(md_content, encoding="utf-8")
             logger.info(f"  Written: {md_path}")
+
+            # Update and save the user profile with insights from today
+            try:
+                logger.info("  Updating user profile...")
+                profile = update_user_profile(client, date, summary_data, profile)
+                save_user_profile(profile)
+                logger.info(f"  Profile updated ({len(profile.get('frequent_topics', []))} topics, "
+                            f"{len(profile.get('example_posts', []))} post examples)")
+            except Exception as pe:
+                logger.warning(f"  Profile update skipped: {pe}")
+
         except Exception as e:
             logger.error(
                 f"  Failed to generate Markdown for {date}: {e}", exc_info=True
