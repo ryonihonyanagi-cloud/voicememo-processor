@@ -411,8 +411,17 @@ def phase1_copy_from_usb(manifest: dict) -> set[str]:
             try:
                 _copy_to_google_drive(staging_path, gdrive_path)
                 logger.info(f"  → Copied to Google Drive: {gdrive_path.parent.name}/{gdrive_path.name}")
+                
+                # Step 3: Delete from recorder once safely backed up to Google Drive
+                try:
+                    os.remove(file_info["path"])
+                    logger.info(f"  → Deleted from recorder: {filename}")
+                except Exception as e:
+                    logger.warning(f"  Unable to delete {filename} from recorder: {e}")
+
             except OSError as e:
                 # Google Drive write failure is non-fatal — staging copy is enough
+                # BUT we don't delete from USB in this case to be safe
                 logger.warning(f"  Google Drive copy failed (will retry later): {e}")
 
             manifest["copied"][filename] = {
@@ -437,7 +446,7 @@ def phase1_copy_from_usb(manifest: dict) -> set[str]:
         update_status("processing", 1, "MP3変換完了", files_total=len(new_files), files_completed=len(new_files))
         notify(
             "Voice Memo",
-            f"Phase 1完了: {len(new_files)}件を変換済み。USBは安全に取り外せます",
+            f"Phase 1完了: {len(new_files)}件を保存・USBから削除しました",
             sound="Glass",
         )
 
@@ -943,8 +952,9 @@ def summarize_transcripts(
 }}
 
 ルール:
-- summaryはこの日1日の流れを時系列で具体的にまとめてください
-- time_breakdownは録音時刻をもとに時間帯ごとの活動を列挙。移動中・雑談・環境音のみの時間帯は含めなくてOKです
+- summaryはこの日1日の流れを朝から夜まで時系列で具体的にまとめてください。長時間の会議や雑談だけでなく、1日全体の活動が把握できるようにバランスよく配分してください
+- time_breakdownは録音時刻をもとに時間帯ごとの活動を列挙。必ず「朝から夜の終わりまで」1日を通して活動を抽出し、ひとつの時間枠（例：深夜だけ、昼だけ）に内容が偏らないよう、最低でも5〜10件は幅広く拾い上げてください。
+- 【重要】time_breakdownの「time」は、"テキスト内で語られている過去の出来事の時刻"ではなく、必ずテキスト内に記載されている `--- Recording at HH:MM ---` の【実際の録音時刻】をベースにしてください（例: 深夜帯に昼間の出来事を振り返って話している場合、時間は「昼」ではなく「深夜」になります）。移動中・雑談・環境音のみの時間帯は省いて構いません。
 - deep_conversationsは「抽象度が高い」「本質的」「ユニークな視点がある」「学びや気づきがある」会話・思考を2〜5件抜粋
 - x_threads_postsは上記の指示に従って5〜10件生成。角度・タイプが被らないようにする
 - 必ずJSONとして正しいフォーマットにしてください（文字列内の改行は必ず \\n エスケープを使用すること）。
