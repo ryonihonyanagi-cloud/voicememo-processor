@@ -2,7 +2,7 @@
 """
 Voice Memo Processor v2.1
   Phase 1: USB mount → WAV to MP3 → Google Drive (date folders)
-  Phase 2: Google Drive MP3 → mlx-whisper local → GPT-4o summary → Markdown
+  Phase 2: Google Drive MP3 → mlx-whisper local → Gemini summary → Markdown
 
 Changes from v2:
 - Anti-hallucination: condition_on_previous_text=False, hallucination_silence_threshold
@@ -24,7 +24,8 @@ from pathlib import Path
 
 import dotenv
 import mlx_whisper
-import openai
+import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -55,7 +56,7 @@ STAGING_DIR = SCRIPT_DIR / "staging"  # Local MP3 copies to avoid FUSE deadlock
 
 MP3_BITRATE = "64k"
 WHISPER_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
-GPT_MODEL = "gpt-4o"
+GEMINI_MODEL = "gemini-1.5-pro"
 
 # File naming: 2026-02-11-17-53-58.WAV
 FILENAME_PATTERN = re.compile(
@@ -92,8 +93,8 @@ def save_user_profile(profile: dict):
     USER_PROFILE_PATH.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def update_user_profile(client, date: str, summary_data: dict, profile: dict) -> dict:
-    """Ask GPT-4o to merge today's insights into the running user profile."""
+def update_user_profile(date: str, summary_data: dict, profile: dict) -> dict:
+    """Ask Gemini to merge today's insights into the running user profile."""
     new_posts = summary_data.get("x_threads_posts", [])
     new_topics = summary_data.get("deep_conversations", [])
     today_summary = summary_data.get("summary", "")
@@ -104,7 +105,7 @@ def update_user_profile(client, date: str, summary_data: dict, profile: dict) ->
     ]
     profile["example_posts"] = all_posts[-20:]
 
-    # Ask GPT to update the topic list and tone description
+    # Ask Gemini to update the topic list and tone description
     topics_block = "\n".join(
         f"- {dc.get('topic', '')}: {dc.get('insight', '')}" for dc in new_topics
     )
@@ -141,7 +142,7 @@ def update_user_profile(client, date: str, summary_data: dict, profile: dict) ->
 - 全て日本語"""
 
     try:
-        result = _call_summary_api(client, update_prompt)
+        result = _call_summary_api(update_prompt)
         if isinstance(result, dict):
             if result.get("frequent_topics"):
                 profile["frequent_topics"] = result["frequent_topics"]
@@ -808,7 +809,7 @@ def phase2_transcribe(manifest: dict) -> set[str]:
 
 
 # ──────────────────────────────────────────────
-# Phase 3: GPT-4o summary + Markdown
+# Phase 3: Gemini summary + Markdown
 # ──────────────────────────────────────────────
 
 
@@ -816,7 +817,7 @@ def retry_with_backoff(func, max_retries=3, base_delay=5):
     for attempt in range(max_retries):
         try:
             return func()
-        except (openai.RateLimitError, openai.APITimeoutError) as e:
+        except google_exceptions.RetryError as e:
             if attempt == max_retries - 1:
                 raise
             delay = base_delay * (2**attempt)
@@ -825,7 +826,7 @@ def retry_with_backoff(func, max_retries=3, base_delay=5):
                 f"(attempt {attempt + 1}/{max_retries})"
             )
             time.sleep(delay)
-        except openai.APIError as e:
+        except (google_exceptions.GoogleAPIError, Exception) as e:
             if attempt == max_retries - 1:
                 raise
             delay = base_delay * (2**attempt)
@@ -848,33 +849,31 @@ def _build_transcript_block(recordings: list[dict]) -> str:
     return block
 
 
-def _call_summary_api(client: openai.OpenAI, prompt: str) -> dict:
-    """Call GPT-4o with a summary prompt and return parsed JSON."""
-    response = client.chat.completions.create(
-        model=GPT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant that summarizes voice memos "
-                    "in Japanese. Always respond with valid JSON."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.5,
-        max_tokens=4000,
+def _call_summary_api(prompt: str) -> dict:
+    """Call Gemini API with a summary prompt and return parsed JSON."""
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=(
+            "You are a helpful assistant that summarizes voice memos "
+            "in Japanese. Always respond with valid JSON. Do not return Markdown code blocks like ```json, just raw JSON."
+        ),
     )
-    return json.loads(response.choices[0].message.content)
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.5,
+            max_output_tokens=8000,
+        )
+    )
+    return json.loads(response.text)
 
 
 MAX_CHARS_PER_CHUNK = 20000  # ~7,000 tokens — safe for 30k TPM limit
 
 
 def summarize_transcripts(
-    client: openai.OpenAI, date: str, recordings: list[dict],
-    profile: dict | None = None
+    date: str, recordings: list[dict], profile: dict | None = None
 ) -> dict:
     """Call GPT-4o to generate summary and highlights.
 
@@ -909,9 +908,7 @@ def summarize_transcripts(
 
     transcript_block = _build_transcript_block(recordings)
 
-    # If short enough, summarize in one shot
-    if len(transcript_block) <= MAX_CHARS_PER_CHUNK:
-        prompt = f"""以下は{date}のボイスメモの文字起こしです。
+    prompt = f"""以下は{date}のボイスメモの文字起こしです。
 これを分析して、詳細な日報として整理してください。
 
 {transcript_block}
@@ -950,163 +947,11 @@ def summarize_transcripts(
 - time_breakdownは録音時刻をもとに時間帯ごとの活動を列挙。移動中・雑談・環境音のみの時間帯は含めなくてOKです
 - deep_conversationsは「抽象度が高い」「本質的」「ユニークな視点がある」「学びや気づきがある」会話・思考を2〜5件抜粋
 - x_threads_postsは上記の指示に従って5〜10件生成。角度・タイプが被らないようにする
-- 必ずJSONとして正しいフォーマットにしてください（文字列内の改行は必ず \n エスケープを使用すること）。
+- 必ずJSONとして正しいフォーマットにしてください（文字列内の改行は必ず \\n エスケープを使用すること）。
 - 全て日本語で出力してください
 
 {_sns_instructions}"""
-        return _call_summary_api(client, prompt)
-
-    # --- Chunked summarization for long transcripts ---
-    logger.info(
-        f"  Transcript too long ({len(transcript_block)} chars), "
-        f"splitting into chunks of {MAX_CHARS_PER_CHUNK} chars"
-    )
-
-    # Split recordings into chunks that fit under the limit
-    chunks: list[list[dict]] = []
-    current_chunk: list[dict] = []
-    current_len = 0
-
-    for rec in recordings:
-        rec_block = _build_transcript_block([rec])
-        rec_len = len(rec_block)
-
-        if current_len + rec_len > MAX_CHARS_PER_CHUNK and current_chunk:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_len = 0
-
-        current_chunk.append(rec)
-        current_len += rec_len
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    logger.info(f"  Split into {len(chunks)} chunks")
-
-    # Summarize each chunk
-    partial_summaries = []
-    for ci, chunk_recs in enumerate(chunks, 1):
-        chunk_block = _build_transcript_block(chunk_recs)
-        time_range = f"{chunk_recs[0]['time']}〜{chunk_recs[-1]['time']}"
-        logger.info(f"  Summarizing chunk {ci}/{len(chunks)} ({time_range})")
-
-        chunk_prompt = f"""以下は{date}のボイスメモの一部（{time_range}）の文字起こしです。
-この時間帯に何をしていたか、どんな会話や考えがあったかを詳しく抽出してください。
-
-{chunk_block}
-
-以下の形式でJSON出力してください:
-{{
-  "summary": "この時間帯の活動・思考の要約（3〜5文）",
-  "time_breakdown": [
-    {{
-      "time": "開始〜終了",
-      "duration_min": 60,
-      "category": "カテゴリ",
-      "activity": "活動内容",
-      "details": "具体的な内容（3〜5文。何を話したか、どんな意思決定があったか、どんな結果や気づきが生まれたかまで詳しく書く）"
-    }}
-  ],
-  "deep_conversations": [
-    {{
-      "topic": "話題",
-      "insight": "エッセンス（2〜3文）",
-      "quote": "印象的な一言（あれば）"
-    }}
-  ],
-  "action_items": ["TODO"]
-}}
-
-ルール:
-- time_breakdownは録音時刻をもとに活動を列挙
-- deep_conversationsは抽象度が高い・本質的・ユニークな会話や思考を抽出
-- action_itemsがなければ空配列
-- 全て日本語で出力してください"""
-
-        partial = retry_with_backoff(
-            lambda p=chunk_prompt: _call_summary_api(client, p)
-        )
-        partial_summaries.append(partial)
-        time.sleep(2)  # Avoid TPM burst
-
-    # Merge partial summaries into final summary
-    logger.info("  Merging partial summaries...")
-    merge_input = ""
-    for ci, ps in enumerate(partial_summaries, 1):
-        merge_input += f"\n--- パート{ci} ---\n"
-        merge_input += f"要約: {ps.get('summary', '')}\n"
-        if ps.get("time_breakdown"):
-            merge_input += "活動:\n"
-            for act in ps["time_breakdown"]:
-                merge_input += (
-                    f"- {act.get('time', '?')} [{act.get('category', '')}]: {act.get('activity', '')} "
-                    f"({act.get('duration_min', '?')}分) — {act.get('details', '')}\n"
-                )
-        # Legacy support
-        if ps.get("activities"):
-            merge_input += "活動(旧形式):\n"
-            for act in ps["activities"]:
-                merge_input += (
-                    f"- {act.get('time', '?')}: {act.get('activity', '')} "
-                    f"({act.get('duration_min', '?')}分) — {act.get('details', '')}\n"
-                )
-        if ps.get("deep_conversations"):
-            merge_input += "深い会話・考察:\n"
-            for dc in ps["deep_conversations"]:
-                merge_input += f"- [{dc.get('topic','')}] {dc.get('insight','')}\n"
-                if dc.get("quote"):
-                    merge_input += f"  引用: 「{dc.get('quote','')}」\n"
-        if ps.get("action_items"):
-            merge_input += "アクションアイテム:\n"
-            for ai in ps["action_items"]:
-                merge_input += f"- {ai}\n"
-
-    merge_prompt = f"""以下は{date}のボイスメモを複数パートに分けて分析した結果です。
-これらを統合して、1日全体の詳細な日報を作成してください。
-
-{merge_input}
-
-以下の形式でJSON出力してください:
-{{
-  "summary": "この日1日の活動の流れ（5〜8文）",
-  "time_breakdown": [
-    {{
-      "time": "開始〜終了",
-      "duration_min": 60,
-      "category": "カテゴリ",
-      "activity": "活動内容",
-      "details": "詳細（2〜3文）"
-    }}
-  ],
-  "deep_conversations": [
-    {{
-      "topic": "話題",
-      "insight": "エッセンス（2〜4文）",
-      "quote": "印象的な一言（あれば）"
-    }}
-  ],
-  "action_items": ["TODO1", "TODO2"],
-  "x_threads_posts": [
-    {{
-      "platform": "X または Xスレッド または Threads または Instagram",
-      "type": "気づき型・問いかけ型・意見型・引用型・Xスレッド型・Threads用ロング・IGキャプション型",
-      "content": "ポスト文（最低でもXは130字、Threadsは400字を絶対超えること。短すぎるとエラーになります）"
-    }}
-  ]
-}}
-
-ルール:
-- summaryは1日の流れを時系列で具体的にまとめてください
-- time_breakdownは全パートの活動を統合して時系列で並べ、重複を排除してください
-- deep_conversationsは全パートから本質的・ユニーク・学びのある会話を2〜5件選んでください
-- x_threads_postsは上記の指示に従って5〜10件生成してください
-- 必ずJSONとして正しいフォーマットにしてください（文字列内の改行は必ず \n エスケープを使用すること）。
-- 全て日本語で出力してください
-
-{_sns_instructions}"""
-
-    return _call_summary_api(client, merge_prompt)
+    return _call_summary_api(prompt)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -1253,7 +1098,7 @@ def collect_date_transcripts(manifest: dict, date: str) -> list[dict]:
 
 
 def phase3_generate_markdown(
-    manifest: dict, dates_to_regenerate: set[str], client: openai.OpenAI
+    manifest: dict, dates_to_regenerate: set[str]
 ):
     """Phase 3: Generate Markdown reports with GPT-4o summaries."""
     MARKDOWN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1274,7 +1119,7 @@ def phase3_generate_markdown(
         # Guard: don't overwrite an existing Markdown with fewer recordings
         md_path = MARKDOWN_OUTPUT_DIR / f"voicememo-{date}.md"
         if md_path.exists():
-            existing_count = md_path.read_text(encoding="utf-8").count("### ")
+            existing_count = md_path.read_text(encoding="utf-8").count(" Recording (")
             if existing_count > len(recordings):
                 logger.warning(
                     f"  Existing Markdown has {existing_count} recordings, "
@@ -1288,11 +1133,11 @@ def phase3_generate_markdown(
         # Summarize with GPT-4o (pass accumulated profile for SNS post quality)
         try:
             summary_data = retry_with_backoff(
-                lambda d=date, r=recordings: summarize_transcripts(client, d, r, profile=profile)
+                lambda d=date, r=recordings: summarize_transcripts(d, r, profile=profile)
             )
         except Exception as e:
             logger.warning(
-                f"  GPT-4o summarization failed ({e}), generating without summary"
+                f"  Gemini summarization failed ({e}), generating without summary"
             )
             summary_data = {
                 "summary": "(要約の生成に失敗しました。APIクォータ復帰後に再実行してください。)",
@@ -1309,7 +1154,7 @@ def phase3_generate_markdown(
             # Update and save the user profile with insights from today
             try:
                 logger.info("  Updating user profile...")
-                profile = update_user_profile(client, date, summary_data, profile)
+                profile = update_user_profile(date, summary_data, profile)
                 save_user_profile(profile)
                 logger.info(f"  Profile updated ({len(profile.get('frequent_topics', []))} topics, "
                             f"{len(profile.get('example_posts', []))} post examples)")
@@ -1356,12 +1201,13 @@ def _init_env():
     
     # Fallback for the original author
     author_env = Path.home() / "Documents/GitHub/llm-knowledge-base/.env"
-    if not os.environ.get("OPENAI_API_KEY") and author_env.exists():
+    if not os.environ.get("GEMINI_API_KEY") and not os.environ.get("OPENAI_API_KEY") and author_env.exists():
         dotenv.load_dotenv(author_env)
         
-    if not os.environ.get("OPENAI_API_KEY"):
-        logger.error("OPENAI_API_KEY not found in .env (needed for GPT-4o summary)")
+    if not os.environ.get("GEMINI_API_KEY"):
+        logger.error("GEMINI_API_KEY not found in .env (needed for Gemini API)")
         return None
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     manifest = load_manifest()
     manifest = migrate_manifest(manifest)
     return manifest
